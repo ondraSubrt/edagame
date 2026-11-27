@@ -1,0 +1,913 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+<meta charset="UTF-8">
+<title>Vesmírný Eda</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #05030f; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; box-shadow: 0 0 60px #3a2a8a; border-radius: 14px; }
+</style>
+</head>
+<body>
+<canvas id="hra" width="800" height="600"></canvas>
+<script>
+// ===================== Základ =====================
+// Všechny rychlosti jsou "pixely za snímek při 60 FPS".
+// Každý pohyb se násobí `k` (= kolik 60FPS snímků uběhlo), takže hra běží
+// stejně rychle na 60Hz i 120Hz monitoru.
+const canvas = document.getElementById('hra');
+const ctx = canvas.getContext('2d');
+const W = canvas.width, H = canvas.height;
+
+// ---- Nastavení obtížnosti (pro malého hráče) ----
+const RYCHLOST_HRACE = 4.2;      // jak rychle letí raketka
+const RYCHLOST_STREL = 9;
+const RYCHLOST_NEPRATEL = 0.75;  // násobič rychlosti nepřátel
+const RYCHLOST_STREL_NEPRATEL = 2;
+const ZABIT_NA_BOSSE = 15;
+
+function prizpusobOkno() {
+  const s = Math.min(window.innerWidth / W, window.innerHeight / H) * 0.97;
+  canvas.style.width = (W * s) + 'px';
+  canvas.style.height = (H * s) + 'px';
+}
+window.addEventListener('resize', prizpusobOkno);
+prizpusobOkno();
+
+const klavesy = {};
+// mezerník poznáme podle e.code, ať funguje s jakoukoli klávesnicí
+const jmenoKlavesy = e => (e.code === 'Space' || e.key === ' ' || e.key === 'Spacebar') ? ' ' : e.key;
+window.addEventListener('keydown', e => {
+  const kl = jmenoKlavesy(e);
+  if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(kl)) e.preventDefault();
+  if (!klavesy[kl]) stisknuto(kl);
+  klavesy[kl] = true;
+  zvuk.odemkni();
+});
+window.addEventListener('keyup', e => { klavesy[jmenoKlavesy(e)] = false; });
+// kliknutí myší do hry: vrátí klávesnici do hry a funguje jako mezerník
+canvas.addEventListener('mousedown', e => {
+  e.preventDefault();
+  window.focus();
+  zvuk.odemkni();
+  if (stav !== 'hra') stisknuto(' ');
+});
+const maFokus = () => document.hasFocus();
+// když se okno přepne jinam, hra se sama zastaví
+function ztrataOkna() {
+  for (const kl in klavesy) klavesy[kl] = false;
+  if (stav === 'hra') stav = 'pauza';
+}
+window.addEventListener('blur', ztrataOkna);
+document.addEventListener('visibilitychange', () => { if (document.hidden) ztrataOkna(); });
+
+const nahoda = (a, b) => a + Math.random() * (b - a);
+const vzdal = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+let k = 1;      // časový krok (1 = jeden snímek při 60 FPS)
+let cas = 0;    // čas v sekundách, pro animace
+
+// ===================== Zvuky =====================
+const zvuk = {
+  ac: null,
+  odemkni() { if (!this.ac) this.ac = new (window.AudioContext || window.webkitAudioContext)(); },
+  ton(freq, delka, typ = 'square', hlasitost = 0.08, klesani = 0) {
+    if (!this.ac) return;
+    const t = this.ac.currentTime;
+    const o = this.ac.createOscillator(), g = this.ac.createGain();
+    o.type = typ;
+    o.frequency.setValueAtTime(freq, t);
+    if (klesani) o.frequency.exponentialRampToValueAtTime(Math.max(30, freq * klesani), t + delka);
+    g.gain.setValueAtTime(hlasitost, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + delka);
+    o.connect(g); g.connect(this.ac.destination);
+    o.start(t); o.stop(t + delka);
+  },
+  strela() { this.ton(880, 0.08, 'square', 0.025, 0.5); },
+  bum() { this.ton(200, 0.3, 'sawtooth', 0.08, 0.2); },
+  hvezda() { this.ton(1200, 0.08, 'sine', 0.1); setTimeout(() => this.ton(1600, 0.12, 'sine', 0.1), 70); },
+  power() { [523, 659, 784, 1046].forEach((f, i) => setTimeout(() => this.ton(f, 0.15, 'triangle', 0.1), i * 80)); },
+  au() { this.ton(300, 0.4, 'triangle', 0.12, 0.4); },
+  pauza() { this.ton(660, 0.12, 'sine', 0.1); setTimeout(() => this.ton(440, 0.15, 'sine', 0.1), 100); },
+  dal() { this.ton(440, 0.12, 'sine', 0.1); setTimeout(() => this.ton(660, 0.15, 'sine', 0.1), 100); },
+  vyhra() { [523, 659, 784, 659, 784, 1046].forEach((f, i) => setTimeout(() => this.ton(f, 0.2, 'triangle', 0.12), i * 130)); },
+};
+
+// ===================== Grafické pomůcky =====================
+// Zářící "světýlko" - předkreslené jednou, pak se jen razítkuje (rychlé)
+const zareCache = {};
+function zare(barva) {
+  if (zareCache[barva]) return zareCache[barva];
+  const c = document.createElement('canvas');
+  c.width = c.height = 64;
+  const g = c.getContext('2d');
+  const gr = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+  gr.addColorStop(0, barva);
+  gr.addColorStop(0.35, barva + '88');
+  gr.addColorStop(1, barva + '00');
+  g.fillStyle = gr;
+  g.fillRect(0, 0, 64, 64);
+  return (zareCache[barva] = c);
+}
+function kresliZari(x, y, velikost, barva, alfa = 1) {
+  ctx.globalAlpha = alfa;
+  ctx.drawImage(zare(barva), x - velikost / 2, y - velikost / 2, velikost, velikost);
+  ctx.globalAlpha = 1;
+}
+
+// Koule s 3D leskem
+function koule(x, y, r, svetla, tmava) {
+  const g = ctx.createRadialGradient(x - r * 0.35, y - r * 0.4, r * 0.1, x, y, r);
+  g.addColorStop(0, svetla);
+  g.addColorStop(1, tmava);
+  return g;
+}
+
+function odlesk(x, y, r) {
+  ctx.fillStyle = 'rgba(255,255,255,0.55)';
+  ctx.beginPath(); ctx.ellipse(x - r * 0.35, y - r * 0.45, r * 0.28, r * 0.16, -0.5, 0, 7); ctx.fill();
+}
+
+// ===================== Vesmírné pozadí =====================
+// Mlhoviny - předkreslené na vysoké plátno, které se pomalu posouvá
+const MLHA_H = 1200;
+const mlha = document.createElement('canvas');
+mlha.width = W; mlha.height = MLHA_H;
+(function vytvorMlhu() {
+  const g = mlha.getContext('2d');
+  const barvy = ['#6b2fbf', '#2f5fbf', '#bf2f8a', '#2fa6bf', '#4a2fbf'];
+  for (let i = 0; i < 14; i++) {
+    const x = nahoda(0, W), y = nahoda(0, MLHA_H), r = nahoda(120, 280);
+    const b = barvy[i % barvy.length];
+    for (const dy of [-MLHA_H, 0, MLHA_H]) { // kvůli plynulému navázání
+      const gr = g.createRadialGradient(x, y + dy, 0, x, y + dy, r);
+      gr.addColorStop(0, b + '55');
+      gr.addColorStop(0.5, b + '22');
+      gr.addColorStop(1, b + '00');
+      g.fillStyle = gr;
+      g.fillRect(x - r, y + dy - r, r * 2, r * 2);
+    }
+  }
+  // drobný hvězdný prach
+  for (let i = 0; i < 400; i++) {
+    g.fillStyle = `rgba(255,255,255,${nahoda(0.05, 0.3)})`;
+    g.fillRect(nahoda(0, W), nahoda(0, MLHA_H), 1, 1);
+  }
+})();
+let mlhaY = 0;
+
+const hvezdy = [];
+for (let i = 0; i < 110; i++) {
+  const vrstva = Math.random();
+  hvezdy.push({
+    x: nahoda(0, W), y: nahoda(0, H),
+    v: 0.3 + vrstva * 1.6, r: 0.6 + vrstva * 1.8,
+    faze: nahoda(0, 6), mrk: nahoda(1, 4),
+    barva: ['#ffffff', '#cfe3ff', '#fff1c4', '#ffd6f5'][Math.floor(nahoda(0, 4))],
+  });
+}
+const planety = [
+  { x: 140, y: 110, r: 62, a: '#ffc2e2', b: '#8a3a8f', v: 0.18, prstenec: true },
+  { x: 660, y: -320, r: 38, a: '#b8f2ff', b: '#2a6a9a', v: 0.26, prstenec: false },
+];
+
+function posunPozadi() {
+  mlhaY = (mlhaY + 0.15 * k) % MLHA_H;
+  for (const p of planety) {
+    p.y += p.v * k;
+    if (p.y - p.r * 2 > H) { p.y = -p.r * 2 - nahoda(100, 500); p.x = nahoda(60, W - 60); }
+  }
+  for (const s of hvezdy) {
+    s.y += s.v * k;
+    if (s.y > H) { s.y -= H + 4; s.x = nahoda(0, W); }
+  }
+}
+
+function kresliPlanetu(p) {
+  ctx.save();
+  ctx.globalAlpha = 0.85;
+  if (p.prstenec) {
+    ctx.strokeStyle = '#ffe1f099'; ctx.lineWidth = 6;
+    ctx.beginPath(); ctx.ellipse(p.x, p.y, p.r * 1.7, p.r * 0.45, -0.35, Math.PI, Math.PI * 2); ctx.stroke();
+  }
+  ctx.fillStyle = koule(p.x, p.y, p.r, p.a, p.b);
+  ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 7); ctx.fill();
+  // pruhy
+  ctx.save();
+  ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 7); ctx.clip();
+  ctx.fillStyle = '#ffffff18';
+  ctx.fillRect(p.x - p.r, p.y - p.r * 0.3, p.r * 2, p.r * 0.18);
+  ctx.fillRect(p.x - p.r, p.y + p.r * 0.2, p.r * 2, p.r * 0.1);
+  ctx.restore();
+  if (p.prstenec) {
+    ctx.strokeStyle = '#ffe1f0cc'; ctx.lineWidth = 6;
+    ctx.beginPath(); ctx.ellipse(p.x, p.y, p.r * 1.7, p.r * 0.45, -0.35, 0, Math.PI); ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function kresliPozadi() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, '#120a35');
+  g.addColorStop(1, '#071230');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+
+  // mlhovina (dvakrát pod sebou, aby se plynule opakovala)
+  ctx.drawImage(mlha, 0, mlhaY - MLHA_H);
+  ctx.drawImage(mlha, 0, mlhaY);
+
+  for (const p of planety) kresliPlanetu(p);
+
+  for (const s of hvezdy) {
+    const jas = 0.55 + Math.sin(cas * s.mrk + s.faze) * 0.35;
+    ctx.globalAlpha = jas;
+    ctx.fillStyle = s.barva;
+    ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, 7); ctx.fill();
+    if (s.r > 2) { // větší hvězdy mají třpytivý křížek
+      ctx.fillRect(s.x - s.r * 3, s.y - 0.5, s.r * 6, 1);
+      ctx.fillRect(s.x - 0.5, s.y - s.r * 3, 1, s.r * 6);
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+// ===================== Stav hry =====================
+let stav = 'menu'; // menu, hra, pauza, konec, vyhra
+let hrac, strely, nepratele, strelyNepratel, predmety, castice, texty, vlny, ohen;
+let skore, uroven, zabito, dalsiNepritel, boss, otresy, ohnostroj;
+
+function novaHra() {
+  hrac = { x: W / 2, y: H - 90, vx: 0, vy: 0, r: 26, zivoty: 5, sila: 1, nesmrtelny: 0, kadence: 0, naklon: 0, ohenTimer: 0 };
+  strely = []; nepratele = []; strelyNepratel = []; predmety = []; castice = []; texty = []; vlny = []; ohen = [];
+  skore = 0; uroven = 1; zabito = 0; dalsiNepritel = 60; boss = null; otresy = 0; ohnostroj = 0;
+  stav = 'hra';
+  ukazText('Úroveň 1', W / 2, H / 2, '#ffe66d', 48);
+}
+
+function stisknuto(klav) {
+  const pauzaKlavesa = klav === 'p' || klav === 'P' || klav === 'Escape';
+  if (stav === 'hra' && pauzaKlavesa) { stav = 'pauza'; zvuk.pauza(); return; }
+  if (stav === 'pauza' && (pauzaKlavesa || klav === ' ')) { stav = 'hra'; zvuk.dal(); return; }
+  if (klav === ' ' && (stav === 'menu' || stav === 'konec' || stav === 'vyhra')) novaHra();
+}
+
+function ukazText(t, x, y, barva = '#fff', vel = 26) {
+  texty.push({ t, x, y, barva, vel, zivot: 90 });
+}
+
+function vybuch(x, y, barva, pocet = 20) {
+  for (let i = 0; i < pocet; i++) {
+    const uhel = nahoda(0, Math.PI * 2), rych = nahoda(1, 5);
+    castice.push({
+      x, y, vx: Math.cos(uhel) * rych, vy: Math.sin(uhel) * rych,
+      zivot: nahoda(30, 55), max: 55, barva: Math.random() < 0.3 ? '#ffffff' : barva, r: nahoda(2, 5),
+    });
+  }
+  if (pocet >= 15) vlny.push({ x, y, r: 10, zivot: 25, barva });
+}
+
+function posunCastice() {
+  const tlum = Math.pow(0.96, k);
+  for (const c of castice) { c.x += c.vx * k; c.y += c.vy * k; c.vx *= tlum; c.vy *= tlum; c.zivot -= k; }
+  castice = castice.filter(c => c.zivot > 0);
+  for (const o of ohen) { o.x += o.vx * k; o.y += o.vy * k; o.zivot -= k; }
+  ohen = ohen.filter(o => o.zivot > 0);
+  for (const v of vlny) { v.r += 3.5 * k; v.zivot -= k; }
+  vlny = vlny.filter(v => v.zivot > 0);
+  for (const t of texty) { t.y -= 0.6 * k; t.zivot -= k; }
+  texty = texty.filter(t => t.zivot > 0);
+}
+
+// ===================== Nepřátelé =====================
+const DRUHY = [
+  { jmeno: 'blob', barva: '#7CFF6B', svetla: '#d4ffc9', tmava: '#2a9a3a', r: 24, zivoty: 1, body: 10 },
+  { jmeno: 'chobotnice', barva: '#ff6bd6', svetla: '#ffd1f3', tmava: '#b02a8f', r: 26, zivoty: 2, body: 20 },
+  { jmeno: 'kamen', barva: '#c99a72', svetla: '#ecc9a5', tmava: '#6a4a30', r: 30, zivoty: 3, body: 15 },
+];
+
+function pridejNepritele() {
+  const moznosti = uroven === 1 ? [0, 0, 2] : uroven === 2 ? [0, 1, 2] : [0, 1, 1, 2];
+  const d = DRUHY[moznosti[Math.floor(Math.random() * moznosti.length)]];
+  const x = nahoda(60, W - 60);
+  // tvar kamene se vygeneruje jednou, ať se necuká
+  const tvar = [];
+  for (let i = 0; i < 10; i++) tvar.push(nahoda(0.8, 1));
+  nepratele.push({
+    ...d, x, zakladX: x, y: -40, tvar,
+    vy: (nahoda(1, 1.5) + uroven * 0.15) * RYCHLOST_NEPRATEL,
+    faze: nahoda(0, 6), rot: 0, rotV: nahoda(-0.02, 0.02), zasah: 0,
+  });
+}
+
+function pridejBosse() {
+  const zivoty = 30 + uroven * 12;
+  boss = { x: W / 2, y: -120, r: 70, zivoty, max: zivoty, faze: 0, zasah: 0, strelba: 90 };
+  ukazText('Pozor! Velký Bubák!', W / 2, H / 2, '#ff8a5c', 40);
+}
+
+function oci(x, y, roz, vel = 7) {
+  // bělmo
+  ctx.fillStyle = '#fff';
+  ctx.beginPath(); ctx.arc(x - roz, y, vel, 0, 7); ctx.arc(x + roz, y, vel, 0, 7); ctx.fill();
+  // zorničky sledují raketu
+  const dx = hrac ? Math.max(-2, Math.min(2, (hrac.x - 400) / 150)) : 0;
+  ctx.fillStyle = '#1b1030';
+  ctx.beginPath(); ctx.arc(x - roz + dx, y + 2, vel * 0.55, 0, 7); ctx.arc(x + roz + dx, y + 2, vel * 0.55, 0, 7); ctx.fill();
+  ctx.fillStyle = '#fff';
+  ctx.beginPath(); ctx.arc(x - roz + dx - 1.5, y, vel * 0.2, 0, 7); ctx.arc(x + roz + dx - 1.5, y, vel * 0.2, 0, 7); ctx.fill();
+}
+
+function tvaricky(x, y, roz) {
+  ctx.fillStyle = 'rgba(255,120,160,0.45)';
+  ctx.beginPath(); ctx.ellipse(x - roz, y, 6, 3.5, 0, 0, 7); ctx.ellipse(x + roz, y, 6, 3.5, 0, 0, 7); ctx.fill();
+}
+
+function kresliNepritele(n) {
+  ctx.save();
+  ctx.translate(n.x, n.y);
+  const blik = n.zasah > 0;
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = n.tmava;
+  if (n.jmeno === 'blob') {
+    const s = 1 + Math.sin(n.faze * 3) * 0.08;
+    ctx.scale(s, 1 / s);
+    // tykadla
+    ctx.strokeStyle = n.tmava; ctx.lineWidth = 4; ctx.lineCap = 'round';
+    const kyv = Math.sin(n.faze * 4) * 3;
+    ctx.beginPath(); ctx.moveTo(-10, -n.r + 6); ctx.quadraticCurveTo(-14, -n.r - 4, -16 + kyv, -n.r - 12);
+    ctx.moveTo(10, -n.r + 6); ctx.quadraticCurveTo(14, -n.r - 4, 16 + kyv, -n.r - 12); ctx.stroke();
+    ctx.fillStyle = koule(-16 + kyv, -n.r - 12, 6, '#fff7c2', '#f2b51d');
+    ctx.beginPath(); ctx.arc(-16 + kyv, -n.r - 12, 6, 0, 7); ctx.fill();
+    ctx.fillStyle = koule(16 + kyv, -n.r - 12, 6, '#fff7c2', '#f2b51d');
+    ctx.beginPath(); ctx.arc(16 + kyv, -n.r - 12, 6, 0, 7); ctx.fill();
+    // tělo
+    ctx.fillStyle = blik ? '#ffffff' : koule(0, 0, n.r, n.svetla, n.tmava);
+    ctx.beginPath(); ctx.arc(0, 0, n.r, 0, Math.PI * 2); ctx.fill();
+    ctx.lineWidth = 3; ctx.stroke();
+    odlesk(0, 0, n.r);
+    oci(0, -3, 8);
+    tvaricky(0, 6, 15);
+    ctx.strokeStyle = '#1b4a22'; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(0, 7, 7, 0.25, Math.PI - 0.25); ctx.stroke();
+  } else if (n.jmeno === 'chobotnice') {
+    ctx.fillStyle = blik ? '#ffffff' : koule(0, -6, n.r * 1.1, n.svetla, n.tmava);
+    ctx.beginPath(); ctx.arc(0, -4, n.r, Math.PI, 0); ctx.lineTo(n.r, 8);
+    for (let i = 0; i < 4; i++) {
+      const x0 = n.r - i * (n.r / 2);
+      ctx.quadraticCurveTo(x0 - n.r / 4, 26 + Math.sin(n.faze * 5 + i) * 6, x0 - n.r / 2, 8);
+    }
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+    // puntíky
+    ctx.fillStyle = '#ffffff40';
+    ctx.beginPath(); ctx.arc(-14, -18, 4, 0, 7); ctx.arc(12, -22, 3, 0, 7); ctx.arc(18, -10, 2.5, 0, 7); ctx.fill();
+    odlesk(0, -8, n.r);
+    oci(0, -8, 10, 8);
+    tvaricky(0, 2, 17);
+    ctx.fillStyle = '#6a1050';
+    ctx.beginPath(); ctx.ellipse(0, 4, 4, 3, 0, 0, 7); ctx.fill();
+  } else {
+    ctx.rotate(n.rot);
+    ctx.fillStyle = blik ? '#ffffff' : koule(0, 0, n.r, n.svetla, n.tmava);
+    ctx.beginPath();
+    for (let i = 0; i < n.tvar.length; i++) {
+      const u = i / n.tvar.length * Math.PI * 2, rr = n.r * n.tvar[i];
+      ctx.lineTo(Math.cos(u) * rr, Math.sin(u) * rr);
+    }
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+    // krátery
+    for (const [cx, cy, cr] of [[-9, -7, 7], [11, 8, 5], [6, -13, 3.5], [-6, 12, 4]]) {
+      ctx.fillStyle = n.tmava + 'aa';
+      ctx.beginPath(); ctx.arc(cx, cy, cr, 0, 7); ctx.fill();
+      ctx.fillStyle = '#ffffff30';
+      ctx.beginPath(); ctx.arc(cx + 1, cy + 1.2, cr * 0.7, 0, Math.PI); ctx.fill();
+    }
+  }
+  ctx.restore();
+}
+
+function kresliBosse(b) {
+  // fialová aura
+  ctx.globalCompositeOperation = 'lighter';
+  kresliZari(b.x, b.y, 260 + Math.sin(cas * 3) * 20, '#a46bff', 0.5);
+  ctx.globalCompositeOperation = 'source-over';
+
+  ctx.save();
+  ctx.translate(b.x, b.y);
+  const s = 1 + Math.sin(b.faze * 2) * 0.05;
+  ctx.scale(s, 1 / s);
+  ctx.strokeStyle = '#3a1a6a'; ctx.lineWidth = 4;
+  // rohy
+  for (const sm of [-1, 1]) {
+    ctx.fillStyle = koule(sm * 40, -75, 30, '#fff7c2', '#e0a010');
+    ctx.beginPath(); ctx.moveTo(sm * 42, -48); ctx.quadraticCurveTo(sm * 62, -80, sm * 55, -100); ctx.quadraticCurveTo(sm * 40, -75, sm * 20, -62); ctx.closePath();
+    ctx.fill(); ctx.stroke();
+  }
+  // tělo
+  ctx.fillStyle = b.zasah > 0 ? '#f1e6ff' : koule(0, 0, b.r, '#dcc2ff', '#5a2aa0');
+  ctx.beginPath(); ctx.arc(0, 0, b.r, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+  ctx.fillStyle = '#ffffff22';
+  ctx.beginPath(); ctx.arc(-28, 30, 10, 0, 7); ctx.arc(34, 22, 7, 0, 7); ctx.arc(10, -45, 6, 0, 7); ctx.fill();
+  odlesk(0, 0, b.r);
+  // obočí
+  ctx.strokeStyle = '#3a1a6a'; ctx.lineWidth = 6; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(-40, -28); ctx.lineTo(-12, -20); ctx.moveTo(40, -28); ctx.lineTo(12, -20); ctx.stroke();
+  // oči
+  ctx.fillStyle = '#fff';
+  ctx.beginPath(); ctx.arc(-24, -5, 16, 0, 7); ctx.arc(24, -5, 16, 0, 7); ctx.fill();
+  const ox = Math.max(-8, Math.min(8, (hrac.x - b.x) / 60));
+  ctx.fillStyle = '#1b1030';
+  ctx.beginPath(); ctx.arc(-24 + ox, 0, 8, 0, 7); ctx.arc(24 + ox, 0, 8, 0, 7); ctx.fill();
+  ctx.fillStyle = '#fff';
+  ctx.beginPath(); ctx.arc(-27 + ox, -3, 3, 0, 7); ctx.arc(21 + ox, -3, 3, 0, 7); ctx.fill();
+  // pusa
+  ctx.fillStyle = '#2a0a4a';
+  ctx.beginPath(); ctx.arc(0, 28, 22, 0, Math.PI); ctx.fill();
+  ctx.fillStyle = '#ff7ab8';
+  ctx.beginPath(); ctx.ellipse(0, 42, 10, 5, 0, 0, 7); ctx.fill();
+  ctx.fillStyle = '#fff';
+  ctx.beginPath(); ctx.moveTo(-14, 28); ctx.lineTo(-8, 38); ctx.lineTo(-2, 28); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(2, 28); ctx.lineTo(8, 38); ctx.lineTo(14, 28); ctx.fill();
+  ctx.restore();
+
+  // ukazatel života
+  const sirka = 300, x0 = W / 2 - sirka / 2;
+  zaoblenyObdelnik(x0 - 4, 50, sirka + 8, 20, 10, '#00000099');
+  const gr = ctx.createLinearGradient(x0, 0, x0 + sirka, 0);
+  gr.addColorStop(0, '#ff5c8a'); gr.addColorStop(1, '#ffb14a');
+  zaoblenyObdelnik(x0, 54, Math.max(12, sirka * (b.zivoty / b.max)), 12, 6, gr);
+}
+
+function zaoblenyObdelnik(x, y, w, h, r, vypln) {
+  ctx.fillStyle = vypln;
+  ctx.beginPath();
+  ctx.roundRect(x, y, w, h, r);
+  ctx.fill();
+}
+
+// ===================== Hráč =====================
+function kresliRaketu(x, y, naklon = 0) {
+  // záře motoru
+  ctx.globalCompositeOperation = 'lighter';
+  kresliZari(x, y + 34, 70 + Math.sin(cas * 18) * 8, '#ff9a3c', 0.8);
+  ctx.globalCompositeOperation = 'source-over';
+
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(naklon);
+  ctx.lineJoin = 'round';
+  // plamen
+  const pl = 22 + Math.sin(cas * 18) * 4;
+  const gp = ctx.createLinearGradient(0, 24, 0, 24 + pl);
+  gp.addColorStop(0, '#fffbe0'); gp.addColorStop(0.4, '#ffcc4d'); gp.addColorStop(1, '#ff5c2a00');
+  ctx.fillStyle = gp;
+  ctx.beginPath(); ctx.moveTo(-11, 24); ctx.quadraticCurveTo(0, 24 + pl * 1.3, 11, 24); ctx.fill();
+
+  ctx.strokeStyle = '#2a1f55'; ctx.lineWidth = 2.5;
+  // křídla
+  for (const s of [-1, 1]) {
+    const gk = ctx.createLinearGradient(s * 12, 0, s * 38, 24);
+    gk.addColorStop(0, '#ff7a7a'); gk.addColorStop(1, '#c0283c');
+    ctx.fillStyle = gk;
+    ctx.beginPath(); ctx.moveTo(s * 12, -2); ctx.lineTo(s * 38, 20); ctx.lineTo(s * 36, 27); ctx.lineTo(s * 12, 21); ctx.closePath();
+    ctx.fill(); ctx.stroke();
+    // světýlko na křídle
+    ctx.fillStyle = s < 0 ? '#7CFF6B' : '#4fc3f7';
+    ctx.beginPath(); ctx.arc(s * 33, 22, 2.5, 0, 7); ctx.fill();
+  }
+  // trup s kovovým leskem
+  const gt = ctx.createLinearGradient(-16, 0, 16, 0);
+  gt.addColorStop(0, '#9fb0d8'); gt.addColorStop(0.35, '#ffffff'); gt.addColorStop(1, '#7a88b8');
+  ctx.fillStyle = gt;
+  ctx.beginPath();
+  ctx.moveTo(0, -36);
+  ctx.quadraticCurveTo(19, -10, 14, 26);
+  ctx.lineTo(-14, 26);
+  ctx.quadraticCurveTo(-19, -10, 0, -36);
+  ctx.fill(); ctx.stroke();
+  // červená špička
+  ctx.save();
+  ctx.clip();
+  ctx.fillStyle = '#ff5c5c';
+  ctx.fillRect(-20, -40, 40, 14);
+  ctx.fillStyle = '#c0283c';
+  ctx.fillRect(-20, 18, 40, 10);
+  ctx.restore();
+  // okénko
+  ctx.fillStyle = koule(0, -6, 9, '#d9f6ff', '#1f7fc7');
+  ctx.beginPath(); ctx.arc(0, -6, 9, 0, 7); ctx.fill();
+  ctx.lineWidth = 3; ctx.strokeStyle = '#ffd34d'; ctx.stroke();
+  ctx.fillStyle = '#ffffffcc';
+  ctx.beginPath(); ctx.arc(-3, -9, 3, 0, 7); ctx.fill();
+  ctx.restore();
+}
+
+function kresliHrace() {
+  kresliRaketu(hrac.x, hrac.y, hrac.naklon);
+  // po zásahu: jemná ochranná bublina místo blikání
+  if (hrac.nesmrtelny > 0) {
+    const a = Math.min(1, hrac.nesmrtelny / 30);
+    const gb = ctx.createRadialGradient(hrac.x, hrac.y, 20, hrac.x, hrac.y, 46);
+    gb.addColorStop(0, '#7fe0ff00');
+    gb.addColorStop(0.8, '#7fe0ff40');
+    gb.addColorStop(1, '#bff0ffaa');
+    ctx.globalAlpha = a * (0.85 + Math.sin(cas * 4) * 0.15);
+    ctx.fillStyle = gb;
+    ctx.beginPath(); ctx.arc(hrac.x, hrac.y, 46, 0, 7); ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+}
+
+// ===================== Předměty =====================
+function pustPredmet(x, y) {
+  const r = Math.random();
+  if (r < 0.35) predmety.push({ druh: 'hvezda', x, y });
+  else if (r < 0.45) predmety.push({ druh: 'sila', x, y });
+  else if (r < 0.50) predmety.push({ druh: 'srdce', x, y });
+}
+
+function kresliPredmet(p) {
+  const barva = p.druh === 'hvezda' ? '#ffd84d' : p.druh === 'sila' ? '#4fc3f7' : '#ff4d6d';
+  ctx.globalCompositeOperation = 'lighter';
+  kresliZari(p.x, p.y, 70 + Math.sin(cas * 6) * 8, barva, 0.7);
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.save();
+  ctx.translate(p.x, p.y);
+  const puls = 1 + Math.sin(cas * 6) * 0.1;
+  ctx.scale(puls, puls);
+  ctx.lineWidth = 2.5; ctx.lineJoin = 'round';
+  if (p.druh === 'hvezda') {
+    ctx.rotate(Math.sin(cas * 3) * 0.3);
+    ctx.fillStyle = koule(0, 0, 16, '#fffbe0', '#f2a71d');
+    ctx.strokeStyle = '#b87400';
+    hvezdaTvar(0, 0, 16, 7); ctx.stroke();
+  } else if (p.druh === 'sila') {
+    ctx.fillStyle = koule(0, 0, 17, '#d9f6ff', '#1f7fc7');
+    ctx.strokeStyle = '#0d4a80';
+    ctx.beginPath(); ctx.arc(0, 0, 17, 0, 7); ctx.fill(); ctx.stroke();
+    // blesk
+    ctx.fillStyle = '#ffe66d'; ctx.strokeStyle = '#b87400'; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(3, -11); ctx.lineTo(-6, 2); ctx.lineTo(0, 2); ctx.lineTo(-3, 11); ctx.lineTo(6, -2); ctx.lineTo(0, -2); ctx.closePath();
+    ctx.fill(); ctx.stroke();
+  } else {
+    ctx.fillStyle = koule(0, -3, 18, '#ffc2cf', '#d01f45');
+    ctx.strokeStyle = '#8a0f2a';
+    srdceTvar(0, 0, 17); ctx.stroke();
+    ctx.fillStyle = '#ffffffaa';
+    ctx.beginPath(); ctx.ellipse(-7, -5, 4, 2.5, -0.6, 0, 7); ctx.fill();
+  }
+  ctx.restore();
+}
+
+function hvezdaTvar(x, y, R, r) {
+  ctx.beginPath();
+  for (let i = 0; i < 10; i++) {
+    const u = -Math.PI / 2 + i * Math.PI / 5, rr = i % 2 ? r : R;
+    ctx.lineTo(x + Math.cos(u) * rr, y + Math.sin(u) * rr);
+  }
+  ctx.closePath(); ctx.fill();
+}
+
+function srdceTvar(x, y, s) {
+  ctx.beginPath();
+  ctx.moveTo(x, y + s * 0.7);
+  ctx.bezierCurveTo(x - s * 1.2, y - s * 0.1, x - s * 0.6, y - s * 1, x, y - s * 0.4);
+  ctx.bezierCurveTo(x + s * 0.6, y - s * 1, x + s * 1.2, y - s * 0.1, x, y + s * 0.7);
+  ctx.fill();
+}
+
+// ===================== Aktualizace =====================
+function zraneniHrace() {
+  if (hrac.nesmrtelny > 0) return;
+  hrac.zivoty--;
+  hrac.nesmrtelny = 150;
+  hrac.sila = Math.max(1, hrac.sila - 1);
+  otresy = 12;
+  zvuk.au();
+  vybuch(hrac.x, hrac.y, '#ff5c5c', 25);
+  if (hrac.zivoty <= 0) stav = 'konec';
+}
+
+function zasahNepritele(n, dmg = 1) {
+  n.zivoty -= dmg; n.zasah = 5;
+  if (n.zivoty <= 0) {
+    n.mrtvy = true;
+    skore += n.body; zabito++;
+    vybuch(n.x, n.y, n.barva);
+    zvuk.bum();
+    ukazText('+' + n.body, n.x, n.y, '#ffe66d', 22);
+    pustPredmet(n.x, n.y);
+  } else {
+    vybuch(n.x, n.y - n.r * 0.6, n.barva, 4);
+  }
+}
+
+function aktualizuj() {
+  // pohyb hráče - plynulé rozjetí a zastavení
+  let cilX = 0, cilY = 0;
+  if (klavesy['ArrowLeft']) cilX -= RYCHLOST_HRACE;
+  if (klavesy['ArrowRight']) cilX += RYCHLOST_HRACE;
+  if (klavesy['ArrowUp']) cilY -= RYCHLOST_HRACE;
+  if (klavesy['ArrowDown']) cilY += RYCHLOST_HRACE;
+  const plynulost = 1 - Math.pow(0.78, k);
+  hrac.vx += (cilX - hrac.vx) * plynulost;
+  hrac.vy += (cilY - hrac.vy) * plynulost;
+  hrac.x = Math.max(36, Math.min(W - 36, hrac.x + hrac.vx * k));
+  hrac.y = Math.max(40, Math.min(H - 50, hrac.y + hrac.vy * k));
+  hrac.naklon = hrac.vx * 0.04;
+  if (hrac.nesmrtelny > 0) hrac.nesmrtelny -= k;
+
+  // stopa ohně za raketou
+  hrac.ohenTimer -= k;
+  while (hrac.ohenTimer <= 0) {
+    hrac.ohenTimer += 1.5;
+    ohen.push({ x: hrac.x + nahoda(-5, 5), y: hrac.y + 38, vx: nahoda(-0.3, 0.3) - hrac.vx * 0.2, vy: nahoda(2, 3.5), zivot: 22, max: 22 });
+  }
+
+  // střelba
+  hrac.kadence -= k;
+  if (klavesy[' '] && hrac.kadence <= 0) {
+    hrac.kadence = 10;
+    const s = hrac.sila;
+    strely.push({ x: hrac.x, y: hrac.y - 34, vx: 0 });
+    if (s >= 2) { strely.push({ x: hrac.x - 18, y: hrac.y - 10, vx: -0.5 }); strely.push({ x: hrac.x + 18, y: hrac.y - 10, vx: 0.5 }); }
+    if (s >= 3) { strely.push({ x: hrac.x - 28, y: hrac.y, vx: -1.6 }); strely.push({ x: hrac.x + 28, y: hrac.y, vx: 1.6 }); }
+    zvuk.strela();
+  }
+  for (const s of strely) { s.y -= RYCHLOST_STREL * k; s.x += s.vx * k; }
+  strely = strely.filter(s => s.y > -20 && !s.pryc);
+
+  // nepřátelé se objevují
+  if (!boss && zabito < ZABIT_NA_BOSSE * uroven) {
+    dalsiNepritel -= k;
+    if (dalsiNepritel <= 0) {
+      dalsiNepritel = Math.max(45, 95 - uroven * 10);
+      pridejNepritele();
+    }
+  } else if (!boss && nepratele.length === 0) {
+    pridejBosse();
+  }
+
+  for (const n of nepratele) {
+    n.faze += 0.04 * k;
+    n.y += n.vy * k;
+    n.rot += n.rotV * k;
+    if (n.jmeno !== 'kamen') n.x = n.zakladX + Math.sin(n.faze) * 40;
+    if (n.zasah > 0) n.zasah -= k;
+    if (n.jmeno === 'chobotnice' && n.y < H - 250 && Math.random() < (0.003 + uroven * 0.0008) * k) {
+      strelyNepratel.push({ x: n.x, y: n.y + 20, vx: 0, vy: RYCHLOST_STREL_NEPRATEL });
+    }
+    for (const s of strely) {
+      if (!s.pryc && vzdal(s, n) < n.r + 6) { s.pryc = true; zasahNepritele(n); if (n.mrtvy) break; }
+    }
+    if (!n.mrtvy && vzdal(n, hrac) < n.r + hrac.r - 8) { zasahNepritele(n, 99); zraneniHrace(); }
+    if (n.y > H + 50) n.mrtvy = true;
+  }
+  nepratele = nepratele.filter(n => !n.mrtvy);
+
+  // boss
+  if (boss) {
+    boss.faze += 0.012 * k;
+    if (boss.y < 140) boss.y += 1.2 * k;
+    else boss.x = W / 2 + Math.sin(boss.faze) * 250;
+    if (boss.zasah > 0) boss.zasah -= k;
+    if (boss.y >= 140) boss.strelba -= k;
+    if (boss.strelba <= 0) {
+      boss.strelba = Math.max(70, 120 - uroven * 10);
+      for (let i = -1; i <= 1; i++) strelyNepratel.push({ x: boss.x, y: boss.y + 50, vx: i * 1.1, vy: RYCHLOST_STREL_NEPRATEL });
+    }
+    for (const s of strely) {
+      if (!s.pryc && vzdal(s, boss) < boss.r) {
+        s.pryc = true; boss.zivoty--; boss.zasah = 4;
+        vybuch(s.x, s.y, '#c99bff', 3);
+      }
+    }
+    if (vzdal(boss, hrac) < boss.r + hrac.r - 10) zraneniHrace();
+    if (boss.zivoty <= 0) {
+      for (let i = 0; i < 6; i++) vybuch(boss.x + nahoda(-50, 50), boss.y + nahoda(-50, 50), ['#a46bff', '#ffe66d', '#ff6bd6'][i % 3], 30);
+      otresy = 20;
+      skore += 200;
+      zvuk.vyhra();
+      for (let i = 0; i < 6; i++) predmety.push({ druh: i < 4 ? 'hvezda' : (i === 4 ? 'srdce' : 'sila'), x: boss.x + nahoda(-60, 60), y: boss.y + nahoda(-30, 30) });
+      boss = null;
+      uroven++;
+      strelyNepratel = [];
+      if (uroven > 5) stav = 'vyhra';
+      else ukazText('Hurá! Úroveň ' + uroven, W / 2, H / 2, '#7CFF6B', 48);
+    }
+  }
+
+  // nepřátelské střely
+  for (const s of strelyNepratel) {
+    s.x += s.vx * k; s.y += s.vy * k;
+    if (vzdal(s, hrac) < hrac.r - 6) { s.pryc = true; zraneniHrace(); }
+  }
+  strelyNepratel = strelyNepratel.filter(s => !s.pryc && s.y < H + 20);
+
+  // předměty (s magnetem, aby se snadno sbíraly)
+  const tah = 1 - Math.pow(0.92, k);
+  for (const p of predmety) {
+    p.y += 1.1 * k;
+    const d = vzdal(p, hrac);
+    if (d < 130) { p.x += (hrac.x - p.x) * tah; p.y += (hrac.y - p.y) * tah; }
+    if (d < hrac.r + 14) {
+      p.pryc = true;
+      if (p.druh === 'hvezda') { skore += 25; zvuk.hvezda(); ukazText('+25 ⭐', p.x, p.y, '#ffe66d'); }
+      if (p.druh === 'sila') { hrac.sila = Math.min(3, hrac.sila + 1); zvuk.power(); ukazText('SÍLA!', p.x, p.y, '#4fc3f7', 30); }
+      if (p.druh === 'srdce') { hrac.zivoty = Math.min(5, hrac.zivoty + 1); zvuk.power(); ukazText('Srdíčko!', p.x, p.y, '#ff4d6d', 30); }
+      vybuch(p.x, p.y, p.druh === 'hvezda' ? '#ffd84d' : p.druh === 'sila' ? '#4fc3f7' : '#ff4d6d', 10);
+    }
+  }
+  predmety = predmety.filter(p => !p.pryc && p.y < H + 30);
+
+  if (otresy > 0) otresy = Math.max(0, otresy - k);
+}
+
+// ===================== Kreslení =====================
+function kresliHru() {
+  ctx.save();
+  if (otresy > 0) ctx.translate(Math.sin(cas * 60) * otresy * 0.4, Math.cos(cas * 53) * otresy * 0.4);
+
+  // stopa ohně (pod raketou)
+  ctx.globalCompositeOperation = 'lighter';
+  for (const o of ohen) {
+    const t = o.zivot / o.max;
+    kresliZari(o.x, o.y, 8 + (1 - t) * 22, t > 0.6 ? '#ffd34d' : '#ff6a2a', t * 0.8);
+  }
+  ctx.globalCompositeOperation = 'source-over';
+
+  for (const p of predmety) kresliPredmet(p);
+  for (const n of nepratele) kresliNepritele(n);
+  if (boss) kresliBosse(boss);
+
+  // střely hráče - zářící
+  ctx.globalCompositeOperation = 'lighter';
+  for (const s of strely) {
+    kresliZari(s.x, s.y, 34, '#ffcc4d', 0.9);
+    ctx.fillStyle = '#fffbe0';
+    ctx.beginPath(); ctx.ellipse(s.x, s.y, 3.5, 10, 0, 0, 7); ctx.fill();
+  }
+  // střely nepřátel - velké, pomalé, dobře vidět
+  for (const s of strelyNepratel) kresliZari(s.x, s.y, 44, '#ff4dc4', 0.9);
+  ctx.globalCompositeOperation = 'source-over';
+  for (const s of strelyNepratel) {
+    ctx.fillStyle = koule(s.x, s.y, 9, '#ffe0f6', '#e0309f');
+    ctx.beginPath(); ctx.arc(s.x, s.y, 9, 0, 7); ctx.fill();
+  }
+
+  if (stav === 'hra' || stav === 'pauza') kresliHrace();
+
+  // výbuchy
+  for (const v of vlny) {
+    ctx.globalAlpha = v.zivot / 25 * 0.7;
+    ctx.strokeStyle = v.barva; ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.arc(v.x, v.y, v.r, 0, 7); ctx.stroke();
+  }
+  ctx.globalCompositeOperation = 'lighter';
+  for (const c of castice) {
+    const a = Math.min(1, c.zivot / 20);
+    kresliZari(c.x, c.y, c.r * 5, c.barva, a * 0.7);
+    ctx.globalAlpha = a;
+    ctx.fillStyle = c.barva;
+    ctx.beginPath(); ctx.arc(c.x, c.y, c.r * 0.7, 0, 7); ctx.fill();
+  }
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+  ctx.restore();
+
+  for (const t of texty) {
+    ctx.globalAlpha = Math.min(1, t.zivot / 30);
+    const skok = 1 + Math.max(0, (t.zivot - 75) / 15) * 0.4; // texty "vyskočí"
+    napis(t.t, t.x, t.y, t.vel * skok, t.barva);
+  }
+  ctx.globalAlpha = 1;
+
+  kresliListu();
+}
+
+function kresliListu() {
+  zaoblenyObdelnik(8, 8, 196, 40, 20, '#0b082088');
+  for (let i = 0; i < 5; i++) {
+    const x = 30 + i * 36, y = 29;
+    if (i < hrac.zivoty) {
+      ctx.fillStyle = koule(x, y - 3, 16, '#ffc2cf', '#d01f45');
+      srdceTvar(x, y, 14);
+      ctx.fillStyle = '#ffffffaa';
+      ctx.beginPath(); ctx.ellipse(x - 6, y - 4, 3, 2, -0.6, 0, 7); ctx.fill();
+    } else {
+      ctx.fillStyle = '#ffffff22';
+      srdceTvar(x, y, 14);
+    }
+  }
+  zaoblenyObdelnik(W - 158, 8, 150, 40, 20, '#0b082088');
+  ctx.fillStyle = koule(W - 132, 26, 14, '#fffbe0', '#f2a71d');
+  hvezdaTvar(W - 132, 28, 13, 6);
+  napis(String(skore), W - 22, 29, 26, '#ffe66d', 'right');
+  napis('Úroveň ' + Math.min(uroven, 5), W / 2, 28, 22, '#ffffffcc');
+  napis('P = pauza', W / 2, H - 16, 15, '#ffffff66');
+}
+
+function napis(t, x, y, vel, barva = '#fff', zarovnani = 'center') {
+  ctx.font = `bold ${vel}px "Comic Sans MS", "Chalkboard SE", sans-serif`;
+  ctx.textAlign = zarovnani;
+  ctx.textBaseline = 'middle';
+  ctx.lineJoin = 'round';
+  ctx.lineWidth = Math.max(3, vel / 6);
+  ctx.strokeStyle = '#1a0f45';
+  ctx.strokeText(t, x, y);
+  ctx.fillStyle = barva;
+  ctx.fillText(t, x, y);
+}
+
+function blikajiciNapis(t, x, y, vel, barva) {
+  // když klávesnice nemíří do hry, mezerník by nic neudělal - řekneme to
+  if (!maFokus()) { t = 'Klikni myší do hry'; barva = '#ffb14a'; }
+  ctx.globalAlpha = 0.65 + Math.sin(cas * 4) * 0.35;
+  napis(t, x, y, vel, barva);
+  ctx.globalAlpha = 1;
+}
+
+function klavesa(text, x, y, sirka = 44) {
+  zaoblenyObdelnik(x - sirka / 2, y - 20, sirka, 40, 8, '#2a1f5588');
+  ctx.strokeStyle = '#ffffff88'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.roundRect(x - sirka / 2, y - 20, sirka, 40, 8); ctx.stroke();
+  napis(text, x, y + 1, 22);
+}
+
+function kresliMenu() {
+  const s = 1 + Math.sin(cas * 2) * 0.03;
+  ctx.save();
+  ctx.translate(W / 2, 150); ctx.scale(s, s);
+  napis('Vesmírný Eda', 0, 0, 76, '#ffe66d');
+  ctx.restore();
+  kresliRaketu(W / 2, 290 + Math.sin(cas * 2) * 10, Math.sin(cas * 1.3) * 0.15);
+  klavesa('◀', W / 2 - 150, 395); klavesa('▶', W / 2 - 100, 395);
+  klavesa('▲', W / 2 - 50, 395); klavesa('▼', W / 2, 395);
+  napis('létání', W / 2 + 90, 395, 26, '#fff', 'center');
+  klavesa('MEZERNÍK', W / 2 - 75, 450, 170);
+  napis('střílení', W / 2 + 90, 450, 26, '#fff', 'center');
+  klavesa('P', W / 2 - 75, 505);
+  napis('pauza', W / 2 + 90, 505, 26, '#fff', 'center');
+  blikajiciNapis('Zmáčkni MEZERNÍK!', W / 2, 565, 34, '#7CFF6B');
+}
+
+function kresliPauzu() {
+  ctx.fillStyle = '#0b0820aa';
+  ctx.fillRect(0, 0, W, H);
+  zaoblenyObdelnik(W / 2 - 230, H / 2 - 120, 460, 240, 30, '#1a0f45dd');
+  ctx.strokeStyle = '#7fe0ff88'; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.roundRect(W / 2 - 230, H / 2 - 120, 460, 240, 30); ctx.stroke();
+  // ikona pauzy
+  zaoblenyObdelnik(W / 2 - 28, H / 2 - 95, 20, 56, 6, '#7fe0ff');
+  zaoblenyObdelnik(W / 2 + 8, H / 2 - 95, 20, 56, 6, '#7fe0ff');
+  napis('PAUZA', W / 2, H / 2 + 5, 56, '#ffe66d');
+  blikajiciNapis('MEZERNÍK = hrát dál', W / 2, H / 2 + 70, 28, '#7CFF6B');
+}
+
+function kresliKonec() {
+  ctx.fillStyle = '#0b082099';
+  ctx.fillRect(0, 0, W, H);
+  if (stav === 'vyhra') {
+    napis('🏆 VYHRÁL JSI! 🏆', W / 2, 220, 56, '#ffe66d');
+    napis('Jsi vesmírný hrdina!', W / 2, 290, 32, '#7CFF6B');
+    ohnostroj -= k;
+    if (ohnostroj <= 0) {
+      ohnostroj = 12;
+      vybuch(nahoda(100, W - 100), nahoda(100, 400), ['#ffe66d', '#ff6bd6', '#7CFF6B', '#4fc3f7'][Math.floor(nahoda(0, 4))], 30);
+    }
+  } else {
+    napis('Skvělá práce!', W / 2, 220, 56, '#ffe66d');
+    napis('Došla srdíčka, ale můžeš to zkusit znovu.', W / 2, 290, 26);
+  }
+  napis('Hvězdiček: ' + skore, W / 2, 350, 36, '#ffe66d');
+  blikajiciNapis('MEZERNÍK = hrát znovu', W / 2, 450, 32, '#7CFF6B');
+}
+
+// ===================== Hlavní smyčka =====================
+let posledni = performance.now();
+function smycka(ted) {
+  // k = kolik "60FPS snímků" uběhlo; omezeno, aby po přepnutí okna nic neskočilo
+  const dt = Math.min(ted - posledni, 50);
+  posledni = ted;
+  k = dt / (1000 / 60);
+  cas += dt / 1000;
+
+  // i kdyby se něco pokazilo, smyčka běží dál (hra nezamrzne)
+  requestAnimationFrame(smycka);
+  if (stav === 'hra' && !maFokus()) ztrataOkna();
+  if (stav !== 'pauza') posunPozadi();
+  kresliPozadi();
+  if (stav === 'menu') {
+    kresliMenu();
+  } else {
+    if (stav === 'hra') aktualizuj();
+    if (stav !== 'pauza') posunCastice();
+    kresliHru();
+    if (stav === 'pauza') kresliPauzu();
+    else if (stav !== 'hra') kresliKonec();
+  }
+}
+requestAnimationFrame(smycka);
+</script>
+</body>
+</html>
