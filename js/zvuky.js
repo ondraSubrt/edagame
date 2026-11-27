@@ -97,7 +97,7 @@ function syntetizuj(p, sr) {
 
 // smíchá několik vrstev (každá může mít své zpoždění) do jednoho zvuku;
 // `hotove` = už vygenerované vrstvy (při postupném předgenerování)
-function smichej(vrstvy, sr, hotove = []) {
+function smichejZvuk(vrstvy, sr, hotove = []) {
   const casti = vrstvy.map((v, i) => ({ od: Math.round((v.kdy || 0) * sr), data: hotove[i] || syntetizuj(v, sr) }));
   let n = 1;
   casti.forEach(c => { n = Math.max(n, c.od + c.data.length); });
@@ -407,7 +407,7 @@ const zvuk = {
   buf(jmeno, hotove) {
     if (!this.cache[jmeno]) {
       const sr = this.ac.sampleRate;
-      const data = smichej(EFEKTY[jmeno], sr, hotove);
+      const data = smichejZvuk(EFEKTY[jmeno], sr, hotove);
       const b = this.ac.createBuffer(1, data.length, sr);
       b.getChannelData(0).set(data);
       this.cache[jmeno] = b;
