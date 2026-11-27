@@ -336,6 +336,7 @@ const PISEN_BOSS = vytvorPisen({
   ],
 });
 
+const CELKOVA_HLASITOST = 0.3; // celková hlasitost hry (1 = plná, 0.3 = asi třetina)
 const HUDBA_HL = 0.42; // hlasitost hudby (jasně pod efekty)
 
 // obdélníková vlna s libovolnou střídou (jako NES/C64 "pulse")
@@ -367,7 +368,9 @@ const zvuk = {
     const komp = ac.createDynamicsCompressor();
     komp.threshold.value = -16; komp.knee.value = 12; komp.ratio.value = 4;
     komp.attack.value = 0.003; komp.release.value = 0.2;
-    komp.connect(ac.destination);
+    // celková hlasitost až za kompresorem, aby ji nic znovu nezesílilo
+    const vystup = ac.createGain(); vystup.gain.value = CELKOVA_HLASITOST;
+    komp.connect(vystup); vystup.connect(ac.destination);
     this.master = ac.createGain(); this.master.gain.value = 0.75; this.master.connect(komp);
     this.sfx = ac.createGain(); this.sfx.gain.value = 0.85; this.sfx.connect(this.master);
     this.hudba = ac.createGain(); this.hudba.gain.value = 0; this.hudba.connect(this.master);
